@@ -1,0 +1,9 @@
+Metadata-Version: 2.4
+Name: imo-admin
+Version: 0.1.0
+Requires-Python: >=3.10
+Requires-Dist: fastapi>=0.115
+Requires-Dist: uvicorn>=0.30
+Requires-Dist: sqlalchemy>=2.0
+Requires-Dist: psycopg[binary]>=3.2
+Requires-Dist: typer>=0.12

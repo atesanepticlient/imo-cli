@@ -70,7 +70,7 @@ def _request(method: str, endpoint: str, *, token: str | None = None, body: dict
     except httpx.HTTPError as exc:
         raise AuthenticationError(
             f"Could not reach the authentication service at {auth_url()}. "
-            "Check IMO_AUTH_URL or start `imo admin`."
+            "Check IMO_AUTH_URL or start `imo admin` or contact your administrator."
         ) from exc
     try:
         payload = response.json()

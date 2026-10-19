@@ -1,6 +1,8 @@
 """imo — IMO automation CLI (uiautomator2, concurrent, no Appium server).
 
 Usage:
+  imo login                   Sign in with an administrator-issued key.
+  imo logout                  Remove the saved login token.
   imo devices                 List connected Android devices.
   imo open <app> [--all|--serial S]   Launch an app on one or all devices.
   imo run [--json FILE]       Run the IMO workflow on all devices concurrently.
@@ -71,7 +73,7 @@ console = Console()
 @app.callback()
 def authentication_gate(ctx: typer.Context):
     """Require a valid token/IP pair for each operational command."""
-    if ctx.invoked_subcommand in {"login", "logout", "admin", "version", "help"}:
+    if ctx.invoked_subcommand in {"login", "logout", "version", "help"}:
         return
     if ctx.invoked_subcommand:
         require_auth()
@@ -95,27 +97,6 @@ def logout():
     auth_logout(console)
 
 
-@app.command()
-def admin(
-    host: str = typer.Option("127.0.0.1", "--host", help="Control panel bind address"),
-    port: int = typer.Option(8765, "--port", min=1, max=65535, help="Control panel port"),
-    init_db: bool = typer.Option(False, "--init-db", help="Create the authentication tables then exit"),
-):
-    """Start the administrator panel, or create its database tables."""
-    from .server import initialize_database
-
-    if init_db:
-        initialize_database()
-        console.print("[green]Authentication database tables are ready.[/green]")
-        return
-    if not __import__("os").getenv("IMO_ADMIN_PASSWORD"):
-        raise typer.BadParameter("Set IMO_ADMIN_PASSWORD before starting the control panel.")
-    import uvicorn
-
-    console.print(f"[cyan]Admin panel: http://{host}:{port}/admin[/cyan]")
-    uvicorn.run("imocli.server:app", host=host, port=port, reload=False)
-
-
 HELP_TEXT = """\
 [b]imo[/b] — concurrent IMO Multi Space automation on uiautomator2.
 
@@ -136,8 +117,6 @@ HELP_TEXT = """\
   [cyan]imo doctor[/cyan]                    Diagnose adb, devices, agent and Multi Space setup.
   [cyan]imo login[/cyan]                     Sign in with an administrator-issued key.
   [cyan]imo logout[/cyan]                    Remove this computer's saved login token.
-  [cyan]imo admin --init-db[/cyan]           Create authentication tables.
-  [cyan]imo admin[/cyan]                     Start the local control panel.
 
 [b]What it does[/b]
   For each device, the workflow:

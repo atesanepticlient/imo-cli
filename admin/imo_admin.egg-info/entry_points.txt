@@ -1,0 +1,2 @@
+[console_scripts]
+imo-admin = imo_admin.cli:run

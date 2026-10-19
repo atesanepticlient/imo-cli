@@ -28,5 +28,3 @@ imo = "imocli.cli:main"
 [tool.setuptools.packages.find]
 include = ["imocli*"]
 
-[tool.setuptools.package-data]
-imocli = ["static/*"]
