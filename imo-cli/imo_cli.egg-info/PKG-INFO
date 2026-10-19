@@ -1,0 +1,153 @@
+Metadata-Version: 2.4
+Name: imo-cli
+Version: 0.1.0
+Summary: Fast, concurrent IMO automation CLI on uiautomator2 — drop-in replacement for the Next.js/Appium USB-IMO-DOCK dashboard
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: uiautomator2>=0.19
+Requires-Dist: rich>=13
+Requires-Dist: typer>=0.12
+Requires-Dist: Pillow>=10
+Requires-Dist: cryptography>=42
+Requires-Dist: fastapi>=0.115
+Requires-Dist: httpx>=0.27
+Requires-Dist: keyring>=25
+Requires-Dist: sqlalchemy>=2.0
+Requires-Dist: psycopg[binary]>=3.2
+Requires-Dist: uvicorn>=0.30
+
+# imo-cli
+
+Automates IMO on Android phones over adb: opens IMO clones, likes recent
+posts in pinned chats, and switches accounts. Works with or without
+Multi Space.
+
+## Requirements
+
+- Python 3.10+
+- adb on PATH (Android platform-tools), or set `ADB_PATH`
+- Phones with USB debugging enabled, connected over USB
+
+## Install
+
+```bash
+cd imo-cli
+pip install -e .
+```
+
+This installs the `imo` command and its dependencies (uiautomator2, rich,
+typer, Pillow).
+
+## Authentication and control panel
+
+The administrator runs the authentication service and uses its deliberately
+plain panel to create one-time login keys, review every login event, and
+suspend a specific token or an entire IP address.
+
+```bash
+# Server only. Use real, private values (PowerShell: $env:NAME="value").
+export DATABASE_URL='postgresql://neondb_owner:npg_SUYFiIt6D0vf@ep-hidden-butterfly-a1hqgtvm-pooler.ap-southeast-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require'
+export IMO_ADMIN_PASSWORD='a-long-unique-password'
+
+# Creates imo_access_keys, imo_auth_sessions, imo_ip_bans and imo_login_events.
+imo admin --init-db
+imo admin --host 0.0.0.0 --port 8765
+```
+
+Open `http://server:8765/admin` and use the configured administrator password.
+The browser asks for HTTP Basic credentials; the username can be anything.
+When deploying behind HTTPS, set `IMO_AUTH_URL=https://your-server` on every
+desktop client. For a local all-in-one setup its default is
+`http://127.0.0.1:8765`.
+
+On the client, an administrator-generated key is requested only by the first
+`imo login`. The returned token is placed in macOS Keychain or Windows
+Credential Manager—not in a project file—and every protected command validates
+both its SHA-256 token hash and the client IP recorded at login.
+
+```bash
+imo login
+imo devices       # operational commands validate authentication first
+imo logout
+```
+
+### Enforcement
+
+`run`, `devices`, `open`, `dump`, `disconnect`, `mirror`, `report`, `init`,
+and `doctor` are all behind the same command-level gate. A missing, suspended,
+expired, or IP-mismatched credential exits before adb or the workflow is
+started. Use `python -m imocli ...` from this project (or `run.bat` on Windows)
+so you execute this release; a separate old `imo` executable already installed
+elsewhere on a computer cannot be retroactively secured by these files.
+
+Set `IMO_TRUST_PROXY_HEADERS=1` only when the server is behind a reverse proxy
+that strips incoming `X-Forwarded-For` headers and writes its own. Otherwise
+the server uses the actual TCP client address.
+
+## Run
+
+```bash
+imo doctor        # check adb, devices, and the IMO setup
+imo devices       # list connected phones
+imo init          # install the uiautomator2 agent on each phone (one time)
+imo run           # run the workflow on all connected phones
+```
+
+`imo run` shows a live dashboard. Stop it with Ctrl+C.
+
+Other useful commands:
+
+| Command                      | What it does                             |
+| ---------------------------- | ---------------------------------------- |
+| `imo run --device <S>`       | Run on one phone only                    |
+| `imo run --json file.ndjson` | Save the run log to a file               |
+| `imo disconnect <S>`         | Stop one phone cleanly                   |
+| `imo report file.ndjson`     | Print a report from a saved `--json` run |
+
+## If the like button isn't found
+
+The Story like button is found by resource id and then by scanning the UI
+dump. If your IMO build uses an id this tool doesn't know, the run log prints
+a line like `Story nodes: ...` listing every node on the story screen. Read
+the like button's id from there and set it before running:
+
+```bash
+export IMO_LIKE_BUTTON_ID=com.imo.android.imoim:id/your_id_here
+```
+
+On Windows use `set IMO_LIKE_BUTTON_ID=...` instead.
+
+## Troubleshooting
+
+| Problem                | Fix                                                                                            |
+| ---------------------- | ---------------------------------------------------------------------------------------------- |
+| `adb not found`        | Install platform-tools or set `ADB_PATH`                                                       |
+| `No devices connected` | Check the USB cable, enable USB debugging, accept the RSA prompt on the phone                  |
+| `agent not reachable`  | Run `imo init`; on some phones grant the uiautomator2 app the Accessibility/overlay permission |
+
+## Like accuracy (how a like is confirmed)
+
+Every like is checked, not assumed:
+
+1. After tapping a post, the tool waits for the viewer to fully open, then
+   looks at the heart icon. The post only counts as **liked** once the heart
+   is actually red.
+2. A tap that had no effect is retried (up to 3 times) and the like button is
+   located again. It is never silently counted as "already liked".
+3. A post that is already red is left alone, so nothing is toggled off.
+4. If a like cannot be confirmed on the picture (the video behind the heart is
+   red, or the heart is an unexpected colour), the tool goes back to the chat
+   and checks for the reaction heart beside the post. If the heart is missing it
+   retries the post once. Posts that still cannot be confirmed are counted as
+   **failed**, and a screenshot is saved in the `imo_debug` folder.
+
+If a phone is slow, give it more time without editing code (Windows: `set`,
+other systems: `export`):
+
+| Setting                   | Default   | Meaning                                      |
+| ------------------------- | --------- | -------------------------------------------- |
+| `IMO_VIEWER_OPEN_TIMEOUT` | 3.0       | Seconds to wait for a tapped post to open    |
+| `IMO_VIEWER_SETTLE`       | 0.35      | Pause after it opens, before tapping like    |
+| `IMO_LIKE_MAX_ATTEMPTS`   | 3         | Like taps per post before giving up          |
+| `IMO_LIKE_VERIFY_POLLS`   | 4         | Checks for the red heart after each tap      |
+| `IMO_DEBUG_DIR`           | imo_debug | Folder for failure screenshots (empty = off) |

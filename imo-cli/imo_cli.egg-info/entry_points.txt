@@ -1,0 +1,2 @@
+[console_scripts]
+imo = imocli.cli:main

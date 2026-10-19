@@ -1,0 +1,7 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>IMO Control Panel</title><link rel="stylesheet" href="/admin.css"></head>
+<body><header><h1>IMO Control Panel</h1><p>Authentication keys, sessions, and login history</p></header><main>
+<section class="box"><h2>Generate login key</h2><form id="key-form"><label>Label <input name="label" maxlength="120" placeholder="e.g. John’s Mac"></label><label>Expires in days <input name="expires_days" type="number" min="1" placeholder="Never"></label><label>Maximum uses <input name="max_uses" type="number" min="1" value="1"></label><button>Generate key</button></form><pre id="new-key" hidden></pre></section>
+<section class="box"><h2>Users</h2><p class="note">Token values are never displayed; only their final 8-character hint is shown.</p><div class="scroll"><table><thead><tr><th>IP</th><th>Token</th><th>Key</th><th>Created</th><th>Last seen</th><th>Status</th><th>Actions</th></tr></thead><tbody id="users"></tbody></table></div></section>
+<section class="box"><h2>Login history</h2><div class="scroll"><table><thead><tr><th>Time</th><th>IP</th><th>Outcome</th><th>Detail</th></tr></thead><tbody id="history"></tbody></table></div></section>
+</main><script src="/admin.js"></script></body></html>
