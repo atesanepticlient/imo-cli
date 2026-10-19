@@ -18,7 +18,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, Field
 from sqlalchemy import DateTime, ForeignKey, Integer, String, create_engine, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
-
+from sqlalchemy.pool import NullPool
 ADMIN_USERNAME = "admin"
 # Set IMO_ENFORCE_IP_MATCH=1 to require the same IP as at login. Default off so
 # users can validate from any device or network.
@@ -130,11 +130,9 @@ _sessions = None
 def get_session_factory():
     global _engine, _sessions
     if _sessions is None:
-        _engine = create_engine(database_url(), pool_pre_ping=True)
+        _engine = create_engine(database_url(), poolclass=NullPool)
         _sessions = sessionmaker(_engine, expire_on_commit=False)
     return _sessions
-
-
 def initialize_database() -> None:
     get_session_factory()
     assert _engine is not None
