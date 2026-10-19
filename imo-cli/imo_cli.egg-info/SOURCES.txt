@@ -17,8 +17,4 @@ imocli/dashboard.py
 imocli/device.py
 imocli/logs.py
 imocli/scroll.py
-imocli/server.py
 imocli/workflow.py
-imocli/static/admin.css
-imocli/static/admin.html
-imocli/static/admin.js

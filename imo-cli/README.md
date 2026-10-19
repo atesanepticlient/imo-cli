@@ -36,11 +36,11 @@ imo admin --init-db
 imo admin --host 0.0.0.0 --port 8765
 ```
 
-Open `http://server:8765/admin` and use the configured administrator password.
+Open `https://imo-cli.vercel.app/admin` and use the configured administrator password.
 The browser asks for HTTP Basic credentials; the username can be anything.
-When deploying behind HTTPS, set `IMO_AUTH_URL=https://your-server` on every
+When deploying behind HTTPS, set `IMO_AUTH_URL=https://imo-cli.vercel.app/` on every
 desktop client. For a local all-in-one setup its default is
-`http://127.0.0.1:8765`.
+`https://imo-cli.vercel.app/`.
 
 On the client, an administrator-generated key is requested only by the first
 `imo login`. The returned token is placed in macOS Keychain or Windows

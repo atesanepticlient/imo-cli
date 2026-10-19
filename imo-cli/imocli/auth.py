@@ -20,7 +20,7 @@ from rich.console import Console
 
 SERVICE_NAME = "imo-cli-auth"
 ACCOUNT_NAME = "default"
-DEFAULT_AUTH_URL = "http://127.0.0.1:8765"
+DEFAULT_AUTH_URL = "https://imo-cli.vercel.app"
 REQUEST_TIMEOUT = 12.0
 
 
