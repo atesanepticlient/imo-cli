@@ -1,0 +1,33 @@
+name: Build IMO CLI for Windows
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Download project
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          python -m pip install pyinstaller
+
+      - name: Build executable
+        run: |
+          python -m PyInstaller --clean --noconfirm --name imo --onedir --console --paths . --collect-submodules imocli --collect-all uiautomator2 --collect-all keyring build_entry.py
+
+      - name: Upload Windows build
+        uses: actions/upload-artifact@v4
+        with:
+          name: imo-windows
+          path: dist/imo/
