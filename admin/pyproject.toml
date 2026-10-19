@@ -21,4 +21,4 @@ imo-admin = "imo_admin.cli:run"
 include = ["imo_admin*"]
 
 [tool.setuptools.package-data]
-imo_admin = ["static/*"]
+imo_admin = ["web/*"]

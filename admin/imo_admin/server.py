@@ -232,7 +232,7 @@ class PasswordChange(BaseModel):
 # --------------------------------------------------------------------------
 
 app = FastAPI(title="IMO Control", docs_url=None, redoc_url=None, lifespan=lifespan)
-_static = Path(__file__).parent / "static"
+_static = Path(__file__).parent / "web"
 
 
 @app.get("/health")
