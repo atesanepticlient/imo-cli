@@ -26,3 +26,6 @@ imo_admin = ["web/*"]
 
 [tool.vercel]
 entrypoint = "imo_admin.server:app"
+
+[tool.setuptools.package-data]
+imo_admin = ["web/*", "web/**/*"]

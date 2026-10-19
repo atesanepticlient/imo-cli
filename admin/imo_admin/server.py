@@ -374,3 +374,21 @@ def change_password(payload: PasswordChange, db: Session = Depends(get_db)) -> d
     account.updated_at = utcnow()
     db.commit()
     return {"status": "updated"}
+
+
+
+# --------------------------------------------------------------------------
+# Desktop Downloads Route
+# --------------------------------------------------------------------------
+
+@app.get("/apps/{filename}")
+def download_app(filename: str):
+    # Security check to prevent directory traversal
+    if ".." in filename or filename.startswith("/"):
+        raise HTTPException(status_code=400, detail="Invalid file path")
+        
+    file_path = _static / "apps" / filename
+    if not file_path.exists() or not file_path.is_file():
+        raise HTTPException(status_code=404, detail="Requested app file not found on server")
+        
+    return FileResponse(file_path, filename=filename)
