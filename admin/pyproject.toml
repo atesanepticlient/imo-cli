@@ -21,11 +21,8 @@ imo-admin = "imo_admin.cli:run"
 include = ["imo_admin*"]
 
 [tool.setuptools.package-data]
-imo_admin = ["web/*"]
+imo_admin = ["web/*","web/**/*"]
 
 
 [tool.vercel]
 entrypoint = "imo_admin.server:app"
-
-[tool.setuptools.package-data]
-imo_admin = ["web/*", "web/**/*"]
