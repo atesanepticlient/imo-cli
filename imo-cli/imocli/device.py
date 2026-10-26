@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 
 from .adb import get_device
 from .constants import (
+    CL_MESSAGE_ROOT,
     EXPECTED_PACKAGES,
     IMO_PACKAGE,
     IV_STICKY_TOP,
@@ -23,6 +24,14 @@ from .constants import (
 
 if TYPE_CHECKING:
     import uiautomator2 as u2
+
+
+class CloneNotReady(RuntimeError):
+    """IMO never showed the chat list (login screen etc.): skip it, don't abort.
+
+    Subclasses RuntimeError so existing `except RuntimeError` code still works.
+    """
+
 
 
 def current_package(d: "u2.Device") -> str:
@@ -162,8 +171,13 @@ def is_chat_list_visible(d: "u2.Device", nodes: list[dict] | None = None) -> boo
     return d(resourceId=MESSAGE_LAYOUT).exists(timeout=0.1) or d(resourceId=CL_MESSAGE_ROOT).exists(timeout=0.1)
 
 
-def ensure_ready(d: "u2.Device", device_id: str, log, max_retry: int = 6) -> None:
-    """Dismiss popups and return to the IMO chat list in milliseconds."""
+def ensure_ready(d: "u2.Device", device_id: str, log, max_retry: int = 12) -> None:
+    """Dismiss popups and reach the IMO chat list, or raise CloneNotReady.
+
+    CloneNotReady (a RuntimeError subclass) means the clone is on a login
+    screen / unknown screen, so the caller can skip it instead of aborting
+    the whole device run.
+    """
     for _ in range(max_retry):
         nodes = parse_page_nodes(d)
         if handle_popups(d, device_id, log, nodes=nodes):
@@ -175,7 +189,7 @@ def ensure_ready(d: "u2.Device", device_id: str, log, max_retry: int = 6) -> Non
         if is_app_package(pkg):
             d.press("back")
         time.sleep(0.3)
-    raise RuntimeError("Unable to reach chat list.")
+    raise CloneNotReady("chat list not reachable (login screen or unknown screen)")
 
 
 def find_pinned_chat(d: "u2.Device", pin_index: int, nodes: list[dict] | None = None) -> dict | None:
@@ -220,5 +234,3 @@ def find_pinned_chat(d: "u2.Device", pin_index: int, nodes: list[dict] | None = 
                 "chat_name": name,
             }
     return None
-
-

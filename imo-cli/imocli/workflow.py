@@ -59,6 +59,7 @@ from .constants import (
     XIV_SWITCH_ACCOUNT,
 )
 from .device import (
+    CloneNotReady,
     current_package,
     ensure_ready,
     find_pinned_chat,
@@ -218,140 +219,230 @@ def contains(outer, inner) -> bool:
 # Multi Space tile traversal
 # ---------------------------------------------------------------------------
 
-def _scroll_rv_to_top(d) -> None:
-    """Scroll Multi Space grid back to the top so tile searches start clean."""
-    try:
-        w, h = d.window_size()
-        center_x = w // 2
-        d.swipe(center_x, int(h * 0.25), center_x, int(h * 0.75), duration=0.15)
-        time.sleep(0.1)
-    except Exception:
-        pass
+# ===== BEGIN: robust multi-scroll discovery / account switching / skip-login-clone =====
+TILE_RE = re.compile(r"^imo(\s*\(\d+\)|\s*\d+)?$", re.IGNORECASE)
+MAX_LIST_SCROLLS = 80          # safety cap for any scroll-to-end loop
+MAX_SWITCH_ATTEMPTS = 3        # tries per account before it is reported failed
+MAX_TILE_ATTEMPTS = 2          # tries per Multi Space tile
 
 
-def _scroll_rv_by_one_row(d, nodes) -> None:
-    rv = next((n for n in nodes if n["resourceId"] == RV_CONTENT or n["resourceId"].endswith(":id/rvContent")), None)
-    if rv:
-        rv_bounds = rv["bounds"]
-    else:
-        rv_bounds = (33, 282, 1167, 2368)
-    first_tile = next((n for n in nodes if n["resourceId"] == LAYOUT_ROOT or n["resourceId"].endswith(":id/layout_root")), None)
-    row_height = first_tile["bounds"][3] - first_tile["bounds"][1] if first_tile else 349
-
-    center_x = (rv_bounds[0] + rv_bounds[2]) // 2
-    start_y = rv_bounds[3] - row_height
-    end_y = start_y - row_height
-    d.swipe(center_x, start_y, center_x, end_y, duration=0.25)
-    time.sleep(0.3)
+def _rid(n: dict, suffix: str) -> bool:
+    """Match a node by resource-id suffix, e.g. _rid(n, 'tvAppName')."""
+    return n["resourceId"].endswith(":id/" + suffix)
 
 
-def _discover_multispace_imo_tiles(d) -> list[str]:
-    """Scan Multi Space grid to discover all existing IMO clone labels instantly."""
-    discovered = set()
-    nodes = parse_page_nodes(d)
-    for n in nodes:
-        if n["resourceId"] == TV_APP_NAME or n["resourceId"].endswith(":id/tvAppName"):
-            t = n["text"].strip()
-            if re.match(r"^imo(\s*\(\d+\)|\s*\d+)?$", t, re.IGNORECASE):
-                discovered.add(t)
 
-    # If few tiles found, scroll down one row to check for more
-    if 0 < len(discovered) < 8:
-        _scroll_rv_by_one_row(d, nodes)
-        nodes2 = parse_page_nodes(d)
-        for n in nodes2:
-            if n["resourceId"] == TV_APP_NAME or n["resourceId"].endswith(":id/tvAppName"):
-                t = n["text"].strip()
-                if re.match(r"^imo(\s*\(\d+\)|\s*\d+)?$", t, re.IGNORECASE):
-                    discovered.add(t)
-        _scroll_rv_to_top(d)
+# ---------------------------------------------------------------------------
+# Skip a clone that is not usable (login screen, logged out, unknown screen)
+# ---------------------------------------------------------------------------
 
-    def sort_key(label: str):
-        m = re.search(r"\d+", label)
-        num = int(m.group()) if m else 0
-        return (0 if num == 0 else 1, num)
-
-    return sorted(discovered, key=sort_key)
+def _is_disconnect(e: Exception) -> bool:
+    return "Disconnected by user" in str(e)
 
 
-def _find_tile_coords(d, target_names: list[str] | str) -> dict | None:
-    """Search the Multi Space grid for a tile matching any of target_names."""
-    if isinstance(target_names, str):
-        target_names = [target_names]
-    targets = {t.strip().lower() for t in target_names}
-
-    max_scroll_attempts = 4
-    for scroll_attempt in range(max_scroll_attempts + 1):
-        nodes = parse_page_nodes(d)
-        for root in [n for n in nodes if n["resourceId"] == LAYOUT_ROOT or n["resourceId"].endswith(":id/layout_root")]:
-            name_node = next(
-                (
-                    n
-                    for n in nodes
-                    if (n["resourceId"] == TV_APP_NAME or n["resourceId"].endswith(":id/tvAppName"))
-                    and contains(root["bounds"], n["bounds"])
-                    and n["text"].strip().lower() in targets
-                ),
-                None,
-            )
-            if not name_node:
-                continue
-            click_node = next(
-                (
-                    n
-                    for n in nodes
-                    if (n["resourceId"] == V_CLICK or n["resourceId"].endswith(":id/vClick"))
-                    and contains(root["bounds"], n["bounds"])
-                ),
-                None,
-            )
-            b = click_node["bounds"] if click_node else root["bounds"]
-            return {
-                "x": (b[0] + b[2]) // 2,
-                "y": (b[1] + b[3]) // 2,
-            }
-        if scroll_attempt < max_scroll_attempts:
-            _scroll_rv_by_one_row(d, nodes)
-    return None
-
-
-def _open_tile_and_return(d, device_id: str, log, coords: dict, label: str) -> None:
-    log(device_id, f"Opening {label}...", "info", {"event": "imo_instance_start", "imoLabel": label})
+def _open_tile_and_return(d, device_id: str, log, coords: dict, label: str) -> bool:
+    """Open a clone and run it. Returns True if processed, False if skipped."""
+    log(device_id, f"Opening {label}...", "info",
+        {"event": "imo_instance_start", "imoLabel": label})
     tap(d, coords["x"], coords["y"])
 
-    # Wait until IMO starts inside Multi Space (<3s)
     deadline = time.time() + 6.0
     while time.time() < deadline:
         nodes = parse_page_nodes(d)
         if handle_popups(d, device_id, log, nodes=nodes):
             break
         if is_chat_list_visible(d, nodes=nodes) or any(
-            n["resourceId"] == HOME_PROFILE_PIC_WRAP or n["resourceId"].endswith(":id/home_profile_pic_wrap")
-            for n in nodes
+            _rid(n, "home_profile_pic_wrap") for n in nodes
         ):
             break
         time.sleep(0.2)
-
     time.sleep(0.3)
     handle_popups(d, device_id, log)
 
-    run_full_imo_workflow(d, device_id, log)
+    processed = True
+    try:
+        run_full_imo_workflow(d, device_id, log)
+    except CloneNotReady as e:
+        processed = False
+        log(device_id, f"{label}: {e} - skipping this clone", "warn",
+            {"event": "imo_instance_skipped", "imoLabel": label})
 
-    # Return cleanly to Multi Space grid
+    # Return cleanly to the Multi Space grid (runs for skipped clones too)
     for _ in range(3):
-        nodes = parse_page_nodes(d)
-        if any(n["resourceId"] == LAYOUT_ROOT or n["resourceId"].endswith(":id/layout_root") for n in nodes):
+        if any(_rid(n, "layout_root") for n in parse_page_nodes(d)):
             break
         d.press("back")
         time.sleep(0.2)
-
     open_app(device_id, MULTISPACE_PACKAGE)
     wait_for_package(d, MULTISPACE_PACKAGE, timeout=4.0)
     time.sleep(0.3)
-    log(device_id, f"{label} finished and closed", "success", {"event": "imo_instance_done", "imoLabel": label})
+    if processed:
+        log(device_id, f"{label} finished and closed", "success",
+            {"event": "imo_instance_done", "imoLabel": label})
+    else:
+        log(device_id, f"{label} skipped (not ready)", "warn",
+            {"event": "imo_instance_done", "imoLabel": label, "skipped": True})
+    return processed
 
 
-def open_all_imo_apps_from_multispace(d, device_id: str, log: LogFn) -> None:
+# ---------------------------------------------------------------------------
+# Generic scrolling helpers
+# ---------------------------------------------------------------------------
+
+def _swipe_in(d, box, down: bool, fraction: float = 0.6) -> None:
+    """Drag INSIDE `box` (x1,y1,x2,y2). down=True reveals later items.
+
+    Slow (0.4s) so Android does not turn it into a fling that skips items,
+    and it stays inside the list so system gestures can't swallow it.
+    """
+    x1, y1, x2, y2 = box
+    h = y2 - y1
+    cx = (x1 + x2) // 2
+    near = y1 + int(h * (0.5 + fraction / 2))
+    far = y1 + int(h * (0.5 - fraction / 2))
+    if down:
+        d.swipe(cx, near, cx, far, duration=0.4)
+    else:
+        d.swipe(cx, far, cx, near, duration=0.4)
+    time.sleep(0.35)
+
+
+def _scroll_to_top(read_visible, swipe_up) -> None:
+    """Swipe toward the top until the visible set stops changing."""
+    prev, stable = None, 0
+    for _ in range(MAX_LIST_SCROLLS):
+        cur = tuple(read_visible())
+        stable = stable + 1 if cur == prev else 0
+        if stable >= 2:
+            return
+        prev = cur
+        swipe_up()
+
+
+def collect_all(read_visible, swipe_down, swipe_up):
+    """Snapshot a scrollable list: top -> end, returning labels in first-seen order.
+
+    Ends when two consecutive scrolls reveal nothing new (one stale pass can be
+    a swallowed swipe, two means the real end of the list).
+    """
+    _scroll_to_top(read_visible, swipe_up)
+    seen, order, stale = set(), [], 0
+    for _ in range(MAX_LIST_SCROLLS):
+        new = [k for k in read_visible() if k not in seen]
+        for k in new:
+            seen.add(k)
+            order.append(k)
+        stale = 0 if new else stale + 1
+        if stale >= 2:
+            break
+        swipe_down()
+    return order
+
+
+# ---------------------------------------------------------------------------
+# Multi Space: snapshot ALL imo tiles, then open them one by one
+# ---------------------------------------------------------------------------
+
+class _Grid:
+    """Reads the Multi Space grid and remembers the RecyclerView bounds."""
+
+    def __init__(self, d):
+        self.d = d
+        self.box = None
+
+    def read_nodes(self):
+        nodes = parse_page_nodes(self.d)
+        rv = next((n for n in nodes if _rid(n, "rvContent")), None)
+        if rv:
+            self.box = rv["bounds"]
+        return nodes
+
+    def bounds(self):
+        if self.box:
+            return self.box
+        w, h = self.d.window_size()
+        return (0, int(h * 0.12), w, int(h * 0.95))
+
+    def labels(self):
+        return [
+            n["text"].strip()
+            for n in self.read_nodes()
+            if _rid(n, "tvAppName") and TILE_RE.match(n["text"].strip())
+        ]
+
+    def down(self):
+        _swipe_in(self.d, self.bounds(), down=True, fraction=0.6)
+
+    def up(self):
+        _swipe_in(self.d, self.bounds(), down=False, fraction=0.6)
+
+
+def discover_all_imo_tiles(d, device_id: str, log) -> list[str]:
+    """Scroll the whole Multi Space grid once and return every imo tile label."""
+    grid = _Grid(d)
+    labels = collect_all(grid.labels, grid.down, grid.up)
+
+    def sort_key(label: str):
+        m = re.search(r"\d+", label)
+        num = int(m.group()) if m else 0
+        return (0 if num == 0 else 1, num)
+
+    labels = sorted(set(labels), key=sort_key)
+    log(device_id, f"Snapshot: {len(labels)} IMO clone(s) in Multi Space",
+        "info", {"event": "tiles_snapshot", "count": len(labels), "labels": labels})
+    return labels
+
+
+def _probe_tile(grid: _Grid, target: str):
+    """One look at the screen: return (coords|None, visible_labels)."""
+    nodes = grid.read_nodes()
+    box = grid.bounds()
+    visible = []
+    for root in [n for n in nodes if _rid(n, "layout_root")]:
+        name = next(
+            (n for n in nodes
+             if _rid(n, "tvAppName") and contains(root["bounds"], n["bounds"])),
+            None,
+        )
+        if not name:
+            continue
+        label = name["text"].strip()
+        visible.append(label)
+        if label.lower() != target:
+            continue
+        click = next(
+            (n for n in nodes if _rid(n, "vClick") and contains(root["bounds"], n["bounds"])),
+            None,
+        )
+        b = (click or root)["bounds"]
+        x, y = (b[0] + b[2]) // 2, (b[1] + b[3]) // 2
+        if box[1] <= y <= box[3]:          # centre must be on-screen, not clipped
+            return {"x": x, "y": y}, visible
+    return None, visible
+
+
+def _find_tile_coords(d, target_names) -> dict | None:
+    """Locate a tile anywhere in the grid: look here, then from the top, to the end."""
+    target = (target_names if isinstance(target_names, str) else target_names[0]).strip().lower()
+    grid = _Grid(d)
+    coords, _ = _probe_tile(grid, target)
+    if coords:
+        return coords                       # already visible, no scrolling needed
+    _scroll_to_top(grid.labels, grid.up)
+    stale, last = 0, None
+    for _ in range(MAX_LIST_SCROLLS):
+        coords, visible = _probe_tile(grid, target)
+        if coords:
+            return coords
+        stale = stale + 1 if visible == last else 0
+        if stale >= 2:                      # end of grid, tile does not exist
+            return None
+        last = visible
+        grid.down()
+    return None
+
+
+def open_all_imo_apps_from_multispace(d, device_id: str, log) -> None:
     log(device_id, "Launching Multi Space for the current Android user...", "info")
     open_app(device_id, MULTISPACE_PACKAGE)
     if not wait_for_package(d, MULTISPACE_PACKAGE, timeout=5.0):
@@ -359,23 +450,296 @@ def open_all_imo_apps_from_multispace(d, device_id: str, log: LogFn) -> None:
     time.sleep(0.5)
     handle_popups(d, device_id, log)
 
-    tiles = _discover_multispace_imo_tiles(d)
+    tiles = discover_all_imo_tiles(d, device_id, log)
     if not tiles:
-        # Fallback to standard clone names if discovery returned empty
         tiles = ["imo", "imo(1)", "imo(2)", "imo(3)"]
+        log(device_id, "Discovery found nothing - using default clone names", "warn")
 
-    log(device_id, f"Found {len(tiles)} IMO clone(s): {', '.join(tiles)}", "info")
+    done, skipped, failed = [], [], []
+    for i, label in enumerate(tiles, 1):
+        ok = False
+        for attempt in range(1, MAX_TILE_ATTEMPTS + 1):
+            checkpoint(d, device_id, MULTISPACE_PACKAGE)
+            log(device_id, f"[{i}/{len(tiles)}] Opening {label} (try {attempt})", "info")
+            coords = _find_tile_coords(d, label)
+            if not coords:
+                log(device_id, f'Could not locate tile "{label}"', "warn")
+            else:
+                try:
+                    processed = _open_tile_and_return(d, device_id, log, coords, label)
+                    (done if processed else skipped).append(label)
+                    ok = True            # skipped clones are NOT retried
+                    break
+                except RuntimeError as e:
+                    if _is_disconnect(e):
+                        raise
+                    log(device_id, f"{label} failed: {e}", "error")
+            # recover: back to a clean Multi Space grid before retrying
+            open_app(device_id, MULTISPACE_PACKAGE)
+            wait_for_package(d, MULTISPACE_PACKAGE, timeout=4.0)
+        if not ok:
+            failed.append(label)
 
-    for label in tiles:
-        checkpoint(d, device_id, MULTISPACE_PACKAGE)
-        log(device_id, f"Opening tile: {label}", "info")
-        coords = _find_tile_coords(d, [label])
-        if not coords:
-            log(device_id, f'Could not locate tile "{label}" — skipping', "warn")
+    msg = f"Finished Multi Space: {len(done)}/{len(tiles)} clone(s) done"
+    if skipped:
+        msg += f"; SKIPPED (not logged in / no chat list): {', '.join(skipped)}"
+    if failed:
+        msg += f"; FAILED: {', '.join(failed)}"
+    log(device_id, msg, "warn" if (failed or skipped) else "success")
+
+
+# ---------------------------------------------------------------------------
+# Accounts: snapshot ALL accounts, then switch to each by key
+# ---------------------------------------------------------------------------
+
+def _account_list_bounds(nodes):
+    c = next((n for n in nodes if _rid(n, "account_list")), None)
+    return c["bounds"] if c else None
+
+
+def get_account_rows(d, nodes=None) -> list[dict]:
+    """Visible account rows: {name, desc, x, y, isCurrent, full}.
+
+    `full` is False for rows clipped by the list edge (unsafe to tap, title
+    may be missing).  Rows without a title are skipped instead of being given
+    a position-based name, because positions change while scrolling.
+    """
+    nodes = nodes if nodes is not None else parse_page_nodes(d)
+    box = _account_list_bounds(nodes)
+    if box is None:
+        return []
+    _, cy1, _, cy2 = box
+
+    def yc(n):
+        return (n["bounds"][1] + n["bounds"][3]) / 2
+
+    rows = []
+    for n in nodes:
+        if not (cy1 <= yc(n) <= cy2):
             continue
-        _open_tile_and_return(d, device_id, log, coords, label)
+        if _rid(n, "account_item_view") or (
+            n.get("className") == "android.widget.RelativeLayout" and n.get("clickable")
+        ):
+            b = n["bounds"]
+            if any(abs(r["y"] - yc(n)) < 10 for r in rows):   # nested duplicate
+                continue
+            rows.append({
+                "x": (b[0] + b[2]) // 2, "y": int(yc(n)),
+                "yTop": b[1], "yBottom": b[3],
+                "full": b[1] >= cy1 - 6 and b[3] <= cy2 + 6,
+                "name": "", "desc": "", "isCurrent": False,
+            })
 
-    log(device_id, "Finished processing all IMO clones in Multi Space", "success")
+    out = []
+    for row in rows:
+        inside = [n for n in nodes if row["yTop"] <= yc(n) <= row["yBottom"]]
+        title = next((n for n in inside if _rid(n, "b_title_view")), None)
+        desc = next((n for n in inside if _rid(n, "b_desc_view")), None)
+        if title is None:
+            continue
+        row["name"] = title["text"]
+        row["desc"] = desc["text"] if desc else ""
+        row["isCurrent"] = any(_rid(n, "toggle") and n.get("selected") is True for n in inside)
+        out.append(row)
+    return out
+
+
+class _AccountList:
+    def __init__(self, d):
+        self.d = d
+        self.box = None
+        self.current = None
+
+    def rows(self):
+        nodes = parse_page_nodes(self.d)
+        self.box = _account_list_bounds(nodes) or self.box
+        rows = get_account_rows(self.d, nodes)
+        cur = next((r for r in rows if r["isCurrent"]), None)
+        if cur:
+            self.current = account_key(cur)
+        return rows
+
+    def keys(self):
+        return [account_key(r) for r in self.rows() if r["full"]]
+
+    def bounds(self):
+        if self.box:
+            return self.box
+        return (0, 737, 1200, 1132)
+
+    def down(self):
+        _swipe_in(self.d, self.bounds(), down=True, fraction=0.6)
+
+    def up(self):
+        _swipe_in(self.d, self.bounds(), down=False, fraction=0.6)
+
+
+def _open_switch_list(d, device_id: str, log) -> None:
+    """Profile -> 'Switch Account' (opens the list; does NOT pick an account)."""
+    open_profile(d, device_id, log)
+    deadline = time.time() + 4.0
+    target = None
+    while time.time() < deadline and target is None:
+        for n in parse_page_nodes(d):
+            if _rid(n, "xiv_switch_account") or n["text"].strip().lower() == "switch account":
+                b = n["bounds"]
+                target = ((b[0] + b[2]) // 2, (b[1] + b[3]) // 2)
+                break
+        else:
+            time.sleep(0.2)
+    if target is None:
+        raise RuntimeError("Switch Account entry not found")
+    tap(d, *target)
+    log(device_id, "Opened account list", "info")
+    time.sleep(0.5)
+
+
+def _wait_home(d, timeout: float = 8.0) -> bool:
+    end = time.time() + timeout
+    while time.time() < end:
+        if any(_rid(n, "home_profile_pic_wrap") for n in parse_page_nodes(d)):
+            return True
+        time.sleep(0.25)
+    return False
+
+
+def _return_home(d) -> None:
+    for _ in range(4):
+        if any(_rid(n, "home_profile_pic_wrap") for n in parse_page_nodes(d)):
+            return
+        d.press("back")
+        time.sleep(0.4)
+
+
+def snapshot_accounts(d, device_id: str, log):
+    """With the account list open: scroll top->end, return (keys, current_key)."""
+    lst = _AccountList(d)
+    keys = collect_all(lst.keys, lst.down, lst.up)
+    log(device_id, f"Snapshot: {len(keys)} account(s): {', '.join(keys)}",
+        "info", {"event": "accounts_snapshot", "count": len(keys), "keys": keys})
+    return keys, lst.current
+
+
+def switch_to_account(d, device_id: str, log, target_key: str, expected_current=None) -> bool:
+    """Open the list, find `target_key` by label (not position), tap it, confirm home."""
+    _open_switch_list(d, device_id, log)
+    lst = _AccountList(d)
+    warned = False
+
+    def look():
+        nonlocal warned
+        rows = lst.rows()
+        if expected_current and lst.current and lst.current != expected_current and not warned:
+            warned = True
+            log(device_id, f'Current account is "{lst.current}", expected "{expected_current}"', "warn")
+        hit = next((r for r in rows if r["full"] and account_key(r) == target_key), None)
+        return hit, [account_key(r) for r in rows if r["full"]]
+
+    hit, visible = look()
+    if hit is None:
+        _scroll_to_top(lambda: look()[1], lst.up)
+        stale, last = 0, None
+        for _ in range(MAX_LIST_SCROLLS):
+            hit, visible = look()
+            if hit:
+                break
+            stale = stale + 1 if visible == last else 0
+            if stale >= 2:
+                break
+            last = visible
+            lst.down()
+    if hit is None:
+        log(device_id, f'Account "{target_key}" not found in list', "warn")
+        _return_home(d)
+        return False
+    if hit["isCurrent"]:                      # already on it
+        _return_home(d)
+        return True
+    tap(d, hit["x"], hit["y"])
+    if not _wait_home(d):
+        log(device_id, "Home screen did not appear after switching", "warn")
+        _return_home(d)
+        return False
+    time.sleep(0.3)
+    return True
+
+
+def run_full_imo_workflow(d, device_id: str, log) -> None:
+    ensure_ready(d, device_id, log)
+    log(device_id, "IMO opened successfully", "success")
+    checkpoint(d, device_id, MULTISPACE_PACKAGE)
+
+    # 1) Work on the account that is active now.
+    process_all_pinned_chats(d, device_id, log)
+
+    # 2) Snapshot every account ONCE (scroll the whole list to its end).
+    _open_switch_list(d, device_id, log)
+    snapshot, current_key = snapshot_accounts(d, device_id, log)
+    _return_home(d)
+    if not snapshot:
+        log(device_id, "Could not read the account list, stopping", "error")
+        return
+    if current_key is None:
+        log(device_id, "Could not detect the active account; it may be processed twice", "warn")
+    else:
+        log(device_id, f'Finished account "{current_key.split("|")[0]}"', "info",
+            {"event": "account_active", "accountName": current_key.split("|")[0]})
+
+    # 3) Process the rest of the snapshot, each one located by its key.
+    done, failed = set(), []
+    while True:
+        if current_key:
+            done.add(current_key)
+        target = next((k for k in snapshot if k not in done), None)
+        if target is None:
+            break
+        name = target.split("|")[0]
+        switched = False
+        for attempt in range(1, MAX_SWITCH_ATTEMPTS + 1):
+            checkpoint(d, device_id, MULTISPACE_PACKAGE)
+            log(device_id, f'Switching to "{name}" ({len(done) + 1}/{len(snapshot)}, try {attempt})',
+                "info", {"event": "account_switch", "accountName": name})
+            try:
+                if switch_to_account(d, device_id, log, target, expected_current=current_key):
+                    switched = True
+                    break
+            except RuntimeError as e:
+                if _is_disconnect(e):
+                    raise
+                log(device_id, f'Switch to "{name}" failed: {e}', "warn")
+        if not switched:
+            failed.append(target)
+            done.add(target)
+            log(device_id, f'Skipping account "{name}" (could not switch)', "error")
+            try:                       # make sure IMO is usable before the next account
+                ensure_ready(d, device_id, log)
+            except RuntimeError as e:
+                if _is_disconnect(e):
+                    raise
+                log(device_id, "IMO not usable after failed switch - ending this clone", "warn")
+                break
+            continue
+        current_key = target
+        process_all_pinned_chats(d, device_id, log)
+        log(device_id, f'Finished account "{name}"', "info",
+            {"event": "account_active", "accountName": name})
+
+    msg = f"Accounts done: {len(snapshot) - len(failed)}/{len(snapshot)}"
+    if failed:
+        msg += f"; FAILED: {', '.join(failed)}"
+    log(device_id, msg, "warn" if failed else "success")
+# ===== END =====
+
+
+
+
+
+
+
+
+
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -433,158 +797,10 @@ def open_profile(d, device_id: str, log) -> None:
     log(device_id, "Profile opened (by top-left fallback)", "success")
 
 
-def _scroll_account_list(d, nodes) -> None:
-    list_node = next(
-        (n for n in nodes if n["resourceId"] == ACCOUNT_LIST or n["resourceId"].endswith(":id/account_list")),
-        None,
-    )
-    if list_node:
-        lb = list_node["bounds"]
-    else:
-        lb = (0, 737, 1200, 1132)
-    item_node = next(
-        (n for n in nodes if n["resourceId"] == ACCOUNT_ITEM_VIEW or n["resourceId"].endswith(":id/account_item_view")),
-        None,
-    )
-    item_height = item_node["bounds"][3] - item_node["bounds"][1] if item_node else 197
-
-    center_x = (lb[0] + lb[2]) // 2
-    start_y = lb[3] - 20
-    end_y = start_y - item_height
-    d.swipe(center_x, start_y, center_x, end_y, duration=0.3)
-    time.sleep(0.6)
 
 
-def open_switch_account(d, device_id: str, log, clicked_account_ids: set[str] | None = None) -> bool:
-    """Click the Switch Account entry, then pick an unclicked account row.
-
-    Returns True if an account was selected, False when the list is exhausted.
-    """
-    clicked_account_ids = clicked_account_ids if clicked_account_ids is not None else set()
-
-    # Step 1: find + click the Switch Account entry (4s window).
-    target = None
-    deadline = time.time() + 4.0
-    while time.time() < deadline:
-        nodes = parse_page_nodes(d)
-        switch = next(
-            (
-                n
-                for n in nodes
-                if n["resourceId"] == XIV_SWITCH_ACCOUNT
-                or n["resourceId"].endswith(":id/xiv_switch_account")
-                or n["text"].strip().lower() == "switch account"
-            ),
-            None,
-        )
-        if switch is not None:
-            b = switch["bounds"]
-            target = ((b[0] + b[2]) // 2, (b[1] + b[3]) // 2)
-            break
-        time.sleep(0.2)
-    if target is None:
-        raise RuntimeError("Switch Account entry not found")
-    tap(d, *target)
-    log(device_id, f'Clicked "Switch Account" at x:{target[0]}, y:{target[1]}', "success")
-    time.sleep(0.5)  # let the account list render
-
-    # Step 2: iterate visible account rows, scrolling one item at a time.
-    for scroll_attempt in range(8):
-        for row in get_account_rows(d):
-            key = account_key(row)
-            if not key or key in clicked_account_ids:
-                continue
-            log(device_id, f'Selecting account "{row["name"]}" at x:{row["x"]}, y:{row["y"]}', "info")
-            tap(d, row["x"], row["y"])
-            clicked_account_ids.add(key)
-            return True
-        if scroll_attempt < 7:
-            log(device_id, "No new unclicked accounts visible, scrolling 1 item height...", "info")
-            _scroll_account_list(d, parse_page_nodes(d))
-    log(device_id, "Finished checking account list — all available accounts have been clicked.", "warn")
-    return False
 
 
-def get_account_rows(d) -> list[dict]:
-    """Parse the account list into {name, desc, x, y, isCurrent} rows.
-
-    Rows are ACCOUNT_ITEM_VIEW nodes (or clickable RelativeLayouts) inside the
-    account_list container. Title / desc / current-toggle are matched to their
-    row by bounds containment — never by list position — so an account's name
-    can't get attached to the wrong row.
-    """
-    nodes = parse_page_nodes(d)
-    container = next(
-        (n for n in nodes if n["resourceId"] == ACCOUNT_LIST or n["resourceId"].endswith(":id/account_list")),
-        None,
-    )
-    if container is None:
-        return []
-    _, cy1, _, cy2 = container["bounds"]
-
-    def in_container(y: float) -> bool:
-        return cy1 <= y <= cy2
-
-    rows = []
-    for n in nodes:
-        b = n["bounds"]
-        y_center = (b[1] + b[3]) / 2
-        if not in_container(y_center):
-            continue
-        cls = n.get("className", "")
-        rid = n.get("resourceId", "")
-        if rid == ACCOUNT_ITEM_VIEW or rid.endswith(":id/account_item_view") or (
-            cls == "android.widget.RelativeLayout" and n.get("clickable")
-        ):
-            rows.append(
-                {
-                    "x": (b[0] + b[2]) // 2,
-                    "y": int(y_center),
-                    "yTop": b[1],
-                    "yBottom": b[3],
-                    "name": "",
-                    "desc": "",
-                    "isCurrent": False,
-                }
-            )
-
-    def y_center(n) -> float:
-        b = n["bounds"]
-        return (b[1] + b[3]) / 2
-
-    for i, row in enumerate(rows):
-        title = next(
-            (
-                n
-                for n in nodes
-                if (n["resourceId"] == B_TITLE_VIEW or n["resourceId"].endswith(":id/b_title_view"))
-                and row["yTop"] <= y_center(n) <= row["yBottom"]
-            ),
-            None,
-        )
-        desc = next(
-            (
-                n
-                for n in nodes
-                if (n["resourceId"] == B_DESC_VIEW or n["resourceId"].endswith(":id/b_desc_view"))
-                and row["yTop"] <= y_center(n) <= row["yBottom"]
-            ),
-            None,
-        )
-        toggle = next(
-            (
-                n
-                for n in nodes
-                if (n["resourceId"] == TOGGLE or n["resourceId"].endswith(":id/toggle"))
-                and n.get("selected") is True
-                and row["yTop"] <= y_center(n) <= row["yBottom"]
-            ),
-            None,
-        )
-        row["name"] = title["text"] if title is not None else f"account_{i}"
-        row["desc"] = desc["text"] if desc is not None else ""
-        row["isCurrent"] = toggle is not None
-    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -1820,49 +2036,6 @@ def process_all_pinned_chats(d, device_id: str, log) -> bool:
 # Full per-imo-instance workflow
 # ---------------------------------------------------------------------------
 
-def run_full_imo_workflow(d, device_id: str, log: LogFn) -> None:
-    processed_accounts: set[str] = set()
-
-    ensure_ready(d, device_id, log)
-    log(device_id, "IMO opened successfully", "success")
-
-    while True:
-        checkpoint(d, device_id, MULTISPACE_PACKAGE)
-
-        process_all_pinned_chats(d, device_id, log)
-
-        open_profile(d, device_id, log)
-        open_switch_account(d, device_id, log)
-
-        time.sleep(0.5)  # let the account list render
-
-        rows = get_account_rows(d)
-        if not rows:
-            log(device_id, "Could not read the account list, stopping", "error")
-            break
-
-        current = next((r for r in rows if r["isCurrent"]), None)
-        if current:
-            processed_accounts.add(account_key(current))
-            # Tells the frontend which account the chats it just watched
-            # actually belonged to (only knowable now).
-            log(device_id, f'Finished account "{current["name"]}"', "info", {"event": "account_active", "accountName": current["name"]})
-
-        next_row = next(
-            (r for r in rows if not r["isCurrent"] and account_key(r) not in processed_accounts),
-            None,
-        )
-        if next_row is None:
-            log(device_id, "No more accounts left to process for this imo instance", "success")
-            break
-
-        log(device_id, f'Switching to account "{next_row["name"]}"', "info", {"event": "account_switch", "accountName": next_row["name"]})
-        tap(d, next_row["x"], next_row["y"])
-
-        # Wait for the newly-selected account's home screen.
-        if not (d(resourceId=HOME_PROFILE_PIC_WRAP).exists(timeout=8.0) or d(resourceIdMatches=r".*:id/home_profile_pic_wrap").exists(timeout=0.2)):
-            log(device_id, "New account home screen did not appear", "warn")
-        time.sleep(0.3)
 
 
 def account_key(row: dict) -> str:
