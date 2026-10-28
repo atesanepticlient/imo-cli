@@ -7,6 +7,18 @@ Key differences from the original:
 - Page-source parsing uses uiautomator2's dump_hierarchy instead of regex-
   scraping WebDriver page source; the selectors, fallbacks and geometry
   rules are identical.
+
+Account handling (this version):
+- When an IMO clone is opened, the switch-account list is scrolled ONCE from
+  top to end and every account is stored in an internal pending storage,
+  keyed by its PHONE NUMBER (stable, unlike names which can change).
+- The active account is processed first (no switch needed), then removed from
+  the storage. Every following account is located in the list by phone
+  number, tapped, processed and removed. The loop ends when the storage is
+  empty. An account is always removed after its turn (done or failed), so the
+  loop can never get stuck.
+- A clone that never shows a chat list (login screen etc.) is silently
+  skipped and the next clone is opened.
 """
 
 from __future__ import annotations
@@ -15,6 +27,7 @@ import os
 import re
 import threading
 import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import Callable
 
@@ -91,6 +104,11 @@ _MAX_DICE_DUMPS = 4
 # Hard cap on chat-screenful scans — guarantees the like loop terminates even
 # on pathological chats (each screenful processes several media rows).
 MAX_LIKE_SCREENFULS = 500
+
+# OPTIONAL extra check after each switch: re-open the account list and confirm
+# the active phone number. OFF by default because it costs an extra visit to
+# the account page after every switch. Turn on with IMO_VERIFY_SWITCH=1.
+VERIFY_SWITCH = os.environ.get("IMO_VERIFY_SWITCH", "0") == "1"
 
 
 def request_disconnect(device_id: str) -> None:
@@ -240,8 +258,36 @@ def _is_disconnect(e: Exception) -> bool:
     return "Disconnected by user" in str(e)
 
 
+def _goto_multispace_grid(d, device_id: str) -> bool:
+    """Go straight to the Multi Space tile grid.
+
+    Launches Multi Space directly (no back-pressing through IMO first) and
+    returns the moment the grid is on screen. Back presses are only a
+    fallback if the launch did not land on the grid.
+    """
+    open_app(device_id, MULTISPACE_PACKAGE)
+    deadline = time.time() + 4.0
+    while time.time() < deadline:
+        if any(_rid(n, "layout_root") for n in parse_page_nodes(d)):
+            return True
+        time.sleep(0.15)
+    for _ in range(3):
+        d.press("back")
+        time.sleep(0.2)
+        if any(_rid(n, "layout_root") for n in parse_page_nodes(d)):
+            return True
+    return False
+
+
 def _open_tile_and_return(d, device_id: str, log, coords: dict, label: str) -> bool:
-    """Open a clone and run it. Returns True if processed, False if skipped."""
+    """Open a clone and run it. Returns True if processed, False if skipped.
+
+    A clone that never shows a chat list (login screen, logged out, unknown
+    screen) is NOT an error: it is skipped silently and the caller moves on to
+    the next clone. Any other unexpected problem inside the clone is logged and
+    the clone is skipped too, so one bad clone can never stop the device run.
+    Only a manual disconnect request propagates.
+    """
     log(device_id, f"Opening {label}...", "info",
         {"event": "imo_instance_start", "imoLabel": label})
     tap(d, coords["x"], coords["y"])
@@ -266,16 +312,15 @@ def _open_tile_and_return(d, device_id: str, log, coords: dict, label: str) -> b
         processed = False
         log(device_id, f"{label}: {e} - skipping this clone", "warn",
             {"event": "imo_instance_skipped", "imoLabel": label})
+    except Exception as e:
+        if _is_disconnect(e):
+            raise
+        processed = False
+        log(device_id, f"{label}: unexpected problem ({e}) - skipping this clone", "warn",
+            {"event": "imo_instance_skipped", "imoLabel": label})
 
     # Return cleanly to the Multi Space grid (runs for skipped clones too)
-    for _ in range(3):
-        if any(_rid(n, "layout_root") for n in parse_page_nodes(d)):
-            break
-        d.press("back")
-        time.sleep(0.2)
-    open_app(device_id, MULTISPACE_PACKAGE)
-    wait_for_package(d, MULTISPACE_PACKAGE, timeout=4.0)
-    time.sleep(0.3)
+    _goto_multispace_grid(d, device_id)
     if processed:
         log(device_id, f"{label} finished and closed", "success",
             {"event": "imo_instance_done", "imoLabel": label})
@@ -470,13 +515,16 @@ def open_all_imo_apps_from_multispace(d, device_id: str, log) -> None:
                     (done if processed else skipped).append(label)
                     ok = True            # skipped clones are NOT retried
                     break
-                except RuntimeError as e:
+                except Exception as e:
                     if _is_disconnect(e):
                         raise
                     log(device_id, f"{label} failed: {e}", "error")
             # recover: back to a clean Multi Space grid before retrying
-            open_app(device_id, MULTISPACE_PACKAGE)
-            wait_for_package(d, MULTISPACE_PACKAGE, timeout=4.0)
+            try:
+                _goto_multispace_grid(d, device_id)
+            except Exception as e:
+                if _is_disconnect(e):
+                    raise
         if not ok:
             failed.append(label)
 
@@ -489,8 +537,25 @@ def open_all_imo_apps_from_multispace(d, device_id: str, log) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Accounts: snapshot ALL accounts, then switch to each by key
+# Accounts: snapshot ALL accounts (by phone number), then switch to each
 # ---------------------------------------------------------------------------
+
+def _phone_digits(desc: str) -> str:
+    """'Phone:1336692075' -> '1336692075' (digits only; '' if none)."""
+    return re.sub(r"\D", "", desc or "")
+
+
+def account_key(row: dict) -> str:
+    """Stable identity of an account row: its phone number.
+
+    Names can be edited or contain emoji/odd characters, a phone number does
+    not change. Falls back to the name only if the row shows no phone.
+    """
+    phone = row.get("phone") or ""
+    if phone:
+        return phone
+    return f'name:{row.get("name", "")}'
+
 
 def _account_list_bounds(nodes):
     c = next((n for n in nodes if _rid(n, "account_list")), None)
@@ -498,7 +563,7 @@ def _account_list_bounds(nodes):
 
 
 def get_account_rows(d, nodes=None) -> list[dict]:
-    """Visible account rows: {name, desc, x, y, isCurrent, full}.
+    """Visible account rows: {name, desc, phone, x, y, isCurrent, full}.
 
     `full` is False for rows clipped by the list edge (unsafe to tap, title
     may be missing).  Rows without a title are skipped instead of being given
@@ -527,7 +592,7 @@ def get_account_rows(d, nodes=None) -> list[dict]:
                 "x": (b[0] + b[2]) // 2, "y": int(yc(n)),
                 "yTop": b[1], "yBottom": b[3],
                 "full": b[1] >= cy1 - 6 and b[3] <= cy2 + 6,
-                "name": "", "desc": "", "isCurrent": False,
+                "name": "", "desc": "", "phone": "", "isCurrent": False,
             })
 
     out = []
@@ -539,21 +604,27 @@ def get_account_rows(d, nodes=None) -> list[dict]:
             continue
         row["name"] = title["text"]
         row["desc"] = desc["text"] if desc else ""
+        row["phone"] = _phone_digits(row["desc"])
         row["isCurrent"] = any(_rid(n, "toggle") and n.get("selected") is True for n in inside)
         out.append(row)
     return out
 
 
 class _AccountList:
+    """Reads the switch-account list. Keys are PHONE NUMBERS."""
+
     def __init__(self, d):
         self.d = d
         self.box = None
-        self.current = None
+        self.current = None          # phone key of the active account (if seen)
+        self.names: dict[str, str] = {}   # phone key -> display name
 
     def rows(self):
         nodes = parse_page_nodes(self.d)
         self.box = _account_list_bounds(nodes) or self.box
         rows = get_account_rows(self.d, nodes)
+        for r in rows:
+            self.names[account_key(r)] = r["name"]
         cur = next((r for r in rows if r["isCurrent"]), None)
         if cur:
             self.current = account_key(cur)
@@ -577,21 +648,52 @@ class _AccountList:
 def _open_switch_list(d, device_id: str, log) -> None:
     """Profile -> 'Switch Account' (opens the list; does NOT pick an account)."""
     open_profile(d, device_id, log)
-    deadline = time.time() + 4.0
-    target = None
-    while time.time() < deadline and target is None:
-        for n in parse_page_nodes(d):
-            if _rid(n, "xiv_switch_account") or n["text"].strip().lower() == "switch account":
+    time.sleep(0.4)
+
+    def find_entry(nodes):
+        for n in nodes:
+            label = f'{n["text"]} {n.get("contentDesc", "")}'.lower()
+            if _rid(n, "xiv_switch_account") or "switch account" in label:
                 b = n["bounds"]
-                target = ((b[0] + b[2]) // 2, (b[1] + b[3]) // 2)
-                break
-        else:
-            time.sleep(0.2)
+                if b[2] > b[0] and b[3] > b[1]:
+                    return ((b[0] + b[2]) // 2, (b[1] + b[3]) // 2)
+        return None
+
+    target = None
+    nodes: list[dict] = []
+    for _ in range(3):
+        deadline = time.time() + 3.0
+        while time.time() < deadline and target is None:
+            nodes = parse_page_nodes(d)
+            target = find_entry(nodes)
+            if target is None:
+                time.sleep(0.2)
+        if target is not None:
+            break
+        # The entry may sit below the fold of the profile page: scroll a bit.
+        w, h = d.window_size()
+        d.swipe(w // 2, int(h * 0.75), w // 2, int(h * 0.35), duration=0.4)
+        time.sleep(0.4)
     if target is None:
+        seen = sorted({
+            (n["text"] or n.get("contentDesc") or n["resourceId"].split("/")[-1]).strip()
+            for n in nodes
+            if (n["text"] or n.get("contentDesc") or n["resourceId"])
+        })
+        log(device_id, "Switch Account entry not found. Screen shows: " + " | ".join(seen)[:400], "warn")
         raise RuntimeError("Switch Account entry not found")
     tap(d, *target)
+
+    # Confirm the account list really opened before anyone reads it.
+    deadline = time.time() + 3.0
+    while time.time() < deadline:
+        if _account_list_bounds(parse_page_nodes(d)) is not None:
+            break
+        time.sleep(0.2)
+    else:
+        raise RuntimeError("Account list did not open")
     log(device_id, "Opened account list", "info")
-    time.sleep(0.5)
+    time.sleep(0.3)
 
 
 def _wait_home(d, timeout: float = 8.0) -> bool:
@@ -612,16 +714,47 @@ def _return_home(d) -> None:
 
 
 def snapshot_accounts(d, device_id: str, log):
-    """With the account list open: scroll top->end, return (keys, current_key)."""
+    """With the account list open: scroll top->end and build the internal
+    storage of accounts.
+
+    Returns (accounts, current_key):
+      accounts     OrderedDict {phone_key: display_name}, list order
+      current_key  phone key of the account that is active right now (or None)
+    """
     lst = _AccountList(d)
     keys = collect_all(lst.keys, lst.down, lst.up)
-    log(device_id, f"Snapshot: {len(keys)} account(s): {', '.join(keys)}",
-        "info", {"event": "accounts_snapshot", "count": len(keys), "keys": keys})
-    return keys, lst.current
+    accounts: "OrderedDict[str, str]" = OrderedDict()
+    for k in keys:
+        accounts[k] = lst.names.get(k) or k
+    pretty = ", ".join(f"{name} ({k})" for k, name in accounts.items())
+    log(device_id, f"Snapshot: {len(accounts)} account(s): {pretty}",
+        "info", {"event": "accounts_snapshot", "count": len(accounts), "keys": list(accounts)})
+    return accounts, lst.current
+
+
+def _read_current_key(d, device_id: str, log):
+    """Open the account list and return the phone key of the ACTIVE account
+    (None if it cannot be told). Always returns to the home screen."""
+    try:
+        _open_switch_list(d, device_id, log)
+        lst = _AccountList(d)
+        lst.rows()
+        return lst.current
+    except Exception as e:
+        if _is_disconnect(e):
+            raise
+        return None
+    finally:
+        try:
+            _return_home(d)
+        except Exception:
+            pass
 
 
 def switch_to_account(d, device_id: str, log, target_key: str, expected_current=None) -> bool:
-    """Open the list, find `target_key` by label (not position), tap it, confirm home."""
+    """Open the list, find the account by PHONE NUMBER (not name/position), tap
+    it, confirm the home screen, then (optionally) confirm that the active
+    account really is the target."""
     _open_switch_list(d, device_id, log)
     lst = _AccountList(d)
     warned = False
@@ -661,72 +794,136 @@ def switch_to_account(d, device_id: str, log, target_key: str, expected_current=
         _return_home(d)
         return False
     time.sleep(0.3)
+
+    if VERIFY_SWITCH:
+        actual = _read_current_key(d, device_id, log)
+        if actual is not None and actual != target_key:
+            log(device_id, f'Switch check: active account is "{actual}", wanted "{target_key}"', "warn")
+            return False
     return True
 
 
+def _process_account(d, device_id: str, log, label: str) -> None:
+    """Process every pinned chat of the ACTIVE account. A problem inside one
+    account is logged and never stops the remaining accounts."""
+    try:
+        process_all_pinned_chats(d, device_id, log)
+    except Exception as e:
+        if _is_disconnect(e):
+            raise
+        log(device_id, f'Account "{label}": chat processing failed ({e}) - moving on', "error")
+        try:
+            _return_home(d)
+        except Exception:
+            pass
+
+
 def run_full_imo_workflow(d, device_id: str, log) -> None:
+    # Raises CloneNotReady when no chat list can be reached; the caller skips
+    # this clone silently and opens the next one.
     ensure_ready(d, device_id, log)
     log(device_id, "IMO opened successfully", "success")
+    log(device_id, "WORKFLOW v3: accounts read once per IMO, no re-check after switching", "info")
     checkpoint(d, device_id, MULTISPACE_PACKAGE)
 
-    # 1) Work on the account that is active now.
-    process_all_pinned_chats(d, device_id, log)
-
-    # 2) Snapshot every account ONCE (scroll the whole list to its end).
-    _open_switch_list(d, device_id, log)
-    snapshot, current_key = snapshot_accounts(d, device_id, log)
-    _return_home(d)
-    if not snapshot:
-        log(device_id, "Could not read the account list, stopping", "error")
-        return
-    if current_key is None:
-        log(device_id, "Could not detect the active account; it may be processed twice", "warn")
-    else:
-        log(device_id, f'Finished account "{current_key.split("|")[0]}"', "info",
-            {"event": "account_active", "accountName": current_key.split("|")[0]})
-
-    # 3) Process the rest of the snapshot, each one located by its key.
-    done, failed = set(), []
-    while True:
-        if current_key:
-            done.add(current_key)
-        target = next((k for k in snapshot if k not in done), None)
-        if target is None:
+    # 1) Build the internal account storage ONCE per opened IMO: open the
+    #    switch-account list, scroll it to the end, remember every phone.
+    accounts: "OrderedDict[str, str]" = OrderedDict()
+    current_key = None
+    for attempt in range(1, 4):
+        try:
+            log(device_id, f"Opening the account list to snapshot accounts (try {attempt}/3)...", "info")
+            _open_switch_list(d, device_id, log)
+            accounts, current_key = snapshot_accounts(d, device_id, log)
+        except Exception as e:
+            if _is_disconnect(e):
+                raise
+            log(device_id, f"Account list try {attempt}/3 failed: {e}", "warn")
+        finally:
+            try:
+                _return_home(d)
+            except Exception:
+                pass
+        if accounts:
             break
-        name = target.split("|")[0]
+        handle_popups(d, device_id, log)
+        time.sleep(0.5)
+
+    if not accounts:
+        log(device_id, "ACCOUNT LIST COULD NOT BE READ after 3 tries - processing the active account only", "error")
+        _process_account(d, device_id, log, "active")
+        return
+
+    # The internal storage: accounts still waiting for their turn.
+    pending: "OrderedDict[str, str]" = OrderedDict(accounts)
+    total = len(accounts)
+    done: list[str] = []
+    failed: list[str] = []
+
+    def label_of(key: str) -> str:
+        name = accounts.get(key) or key
+        return f"{name} ({key})"
+
+    # 2) The active account needs no switch: process it, then drop it from the
+    #    storage.
+    if current_key is None:
+        log(device_id, "Could not detect the active account; each account will be located by phone number", "warn")
+    elif current_key in pending:
+        name = pending[current_key]
+        log(device_id, f'Processing active account "{name}" (1/{total})', "info",
+            {"event": "account_switch", "accountName": name})
+        _process_account(d, device_id, log, name)
+        pending.pop(current_key, None)
+        done.append(current_key)
+        log(device_id, f'Finished account "{name}" - {len(pending)} left', "info",
+            {"event": "account_active", "accountName": name})
+    else:
+        log(device_id, f'Active account "{current_key}" is not in the snapshot', "warn")
+
+    # 3) Work through the rest of the storage until it is empty. An account is
+    #    ALWAYS removed after its turn (done or failed) so this cannot loop
+    #    forever.
+    while pending:
+        key, name = next(iter(pending.items()))
+        position = len(done) + len(failed) + 1
         switched = False
         for attempt in range(1, MAX_SWITCH_ATTEMPTS + 1):
             checkpoint(d, device_id, MULTISPACE_PACKAGE)
-            log(device_id, f'Switching to "{name}" ({len(done) + 1}/{len(snapshot)}, try {attempt})',
+            log(device_id, f'Switching to "{name}" ({key}) - {position}/{total}, try {attempt}',
                 "info", {"event": "account_switch", "accountName": name})
             try:
-                if switch_to_account(d, device_id, log, target, expected_current=current_key):
+                if switch_to_account(d, device_id, log, key, expected_current=current_key):
                     switched = True
                     break
-            except RuntimeError as e:
+            except Exception as e:
                 if _is_disconnect(e):
                     raise
                 log(device_id, f'Switch to "{name}" failed: {e}', "warn")
+        pending.pop(key, None)
+
         if not switched:
-            failed.append(target)
-            done.add(target)
-            log(device_id, f'Skipping account "{name}" (could not switch)', "error")
+            failed.append(key)
+            log(device_id, f'Skipping account "{name}" ({key}) - could not switch', "error")
             try:                       # make sure IMO is usable before the next account
                 ensure_ready(d, device_id, log)
-            except RuntimeError as e:
+            except Exception as e:
                 if _is_disconnect(e):
                     raise
                 log(device_id, "IMO not usable after failed switch - ending this clone", "warn")
+                failed.extend(pending.keys())
+                pending.clear()
                 break
             continue
-        current_key = target
-        process_all_pinned_chats(d, device_id, log)
-        log(device_id, f'Finished account "{name}"', "info",
+
+        current_key = key
+        _process_account(d, device_id, log, name)
+        done.append(key)
+        log(device_id, f'Finished account "{name}" - {len(pending)} left', "info",
             {"event": "account_active", "accountName": name})
 
-    msg = f"Accounts done: {len(snapshot) - len(failed)}/{len(snapshot)}"
+    msg = f"Accounts done: {len(done)}/{total}"
     if failed:
-        msg += f"; FAILED: {', '.join(failed)}"
+        msg += f"; FAILED: {', '.join(label_of(k) for k in failed)}"
     log(device_id, msg, "warn" if failed else "success")
 # ===== END =====
 
@@ -2030,16 +2227,6 @@ def process_all_pinned_chats(d, device_id: str, log) -> bool:
             return True
         processed_count += 1
     return False
-
-
-# ---------------------------------------------------------------------------
-# Full per-imo-instance workflow
-# ---------------------------------------------------------------------------
-
-
-
-def account_key(row: dict) -> str:
-    return f'{row["name"]}|{row["desc"]}'
 
 
 # ---------------------------------------------------------------------------
