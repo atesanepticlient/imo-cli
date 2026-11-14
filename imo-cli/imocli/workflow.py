@@ -258,6 +258,24 @@ def _is_disconnect(e: Exception) -> bool:
     return "Disconnected by user" in str(e)
 
 
+class AccountNotReady(RuntimeError):
+    """The tapped account never reached the IMO home screen (login page,
+    logged-out account, ...). It is skipped at once - never retried."""
+
+
+def _screen_summary(d, limit: int = 300) -> str:
+    """Short list of texts on screen, for the 'not ready' log line."""
+    try:
+        seen = []
+        for n in parse_page_nodes(d):
+            t = (n["text"] or n.get("contentDesc") or "").strip()
+            if t and t not in seen and not n["resourceId"].startswith("com.android.systemui"):
+                seen.append(t)
+        return " | ".join(seen)[:limit]
+    except Exception:
+        return ""
+
+
 def _goto_multispace_grid(d, device_id: str) -> bool:
     """Go straight to the Multi Space tile grid.
 
@@ -557,6 +575,13 @@ def account_key(row: dict) -> str:
     return f'name:{row.get("name", "")}'
 
 
+def _phone_of_key(key) -> str:
+    """Phone number for an account storage key ('' when the key is name-based)."""
+    if not key or str(key).startswith("name:"):
+        return ""
+    return str(key)
+
+
 def _account_list_bounds(nodes):
     c = next((n for n in nodes if _rid(n, "account_list")), None)
     return c["bounds"] if c else None
@@ -728,7 +753,8 @@ def snapshot_accounts(d, device_id: str, log):
         accounts[k] = lst.names.get(k) or k
     pretty = ", ".join(f"{name} ({k})" for k, name in accounts.items())
     log(device_id, f"Snapshot: {len(accounts)} account(s): {pretty}",
-        "info", {"event": "accounts_snapshot", "count": len(accounts), "keys": list(accounts)})
+        "info", {"event": "accounts_snapshot", "count": len(accounts), "keys": list(accounts),
+             "accounts": [{"phone": _phone_of_key(k), "name": n} for k, n in accounts.items()]})
     return accounts, lst.current
 
 
@@ -790,9 +816,13 @@ def switch_to_account(d, device_id: str, log, target_key: str, expected_current=
         return True
     tap(d, hit["x"], hit["y"])
     if not _wait_home(d):
-        log(device_id, "Home screen did not appear after switching", "warn")
+        shown = _screen_summary(d)
+        log(device_id, "Home screen did not appear after switching (login page / logged-out account?)"
+            + (f" Screen shows: {shown}" if shown else ""), "warn")
+        # The only way out of such a screen is Back, which lands on the
+        # previously active account's home - a good place to continue from.
         _return_home(d)
-        return False
+        raise AccountNotReady("no chat list after switching - not logged in?")
     time.sleep(0.3)
 
     if VERIFY_SWITCH:
@@ -871,12 +901,12 @@ def run_full_imo_workflow(d, device_id: str, log) -> None:
     elif current_key in pending:
         name = pending[current_key]
         log(device_id, f'Processing active account "{name}" (1/{total})', "info",
-            {"event": "account_switch", "accountName": name})
+            {"event": "account_switch", "accountName": name, "accountPhone": _phone_of_key(current_key)})
         _process_account(d, device_id, log, name)
         pending.pop(current_key, None)
         done.append(current_key)
         log(device_id, f'Finished account "{name}" - {len(pending)} left', "info",
-            {"event": "account_active", "accountName": name})
+            {"event": "account_active", "accountName": name, "accountPhone": _phone_of_key(current_key)})
     else:
         log(device_id, f'Active account "{current_key}" is not in the snapshot', "warn")
 
@@ -887,14 +917,22 @@ def run_full_imo_workflow(d, device_id: str, log) -> None:
         key, name = next(iter(pending.items()))
         position = len(done) + len(failed) + 1
         switched = False
+        not_ready = False
         for attempt in range(1, MAX_SWITCH_ATTEMPTS + 1):
             checkpoint(d, device_id, MULTISPACE_PACKAGE)
             log(device_id, f'Switching to "{name}" ({key}) - {position}/{total}, try {attempt}',
-                "info", {"event": "account_switch", "accountName": name})
+                "info", {"event": "account_switch", "accountName": name, "accountPhone": _phone_of_key(key)})
             try:
                 if switch_to_account(d, device_id, log, key, expected_current=current_key):
                     switched = True
                     break
+            except AccountNotReady as e:
+                # Login page / logged-out account: do NOT retry, just skip it.
+                not_ready = True
+                log(device_id, f'Account "{name}" ({key}) is not ready ({e}) - skipping it, moving to the next account',
+                    "warn", {"event": "account_failed", "accountName": name,
+                             "accountPhone": _phone_of_key(key), "reason": "not_ready"})
+                break
             except Exception as e:
                 if _is_disconnect(e):
                     raise
@@ -903,7 +941,9 @@ def run_full_imo_workflow(d, device_id: str, log) -> None:
 
         if not switched:
             failed.append(key)
-            log(device_id, f'Skipping account "{name}" ({key}) - could not switch', "error")
+            if not not_ready:
+                log(device_id, f'Skipping account "{name}" ({key}) - could not switch', "error",
+                    {"event": "account_failed", "accountName": name, "accountPhone": _phone_of_key(key)})
             try:                       # make sure IMO is usable before the next account
                 ensure_ready(d, device_id, log)
             except Exception as e:
@@ -919,7 +959,7 @@ def run_full_imo_workflow(d, device_id: str, log) -> None:
         _process_account(d, device_id, log, name)
         done.append(key)
         log(device_id, f'Finished account "{name}" - {len(pending)} left', "info",
-            {"event": "account_active", "accountName": name})
+            {"event": "account_active", "accountName": name, "accountPhone": _phone_of_key(key)})
 
     msg = f"Accounts done: {len(done)}/{total}"
     if failed:
@@ -2118,7 +2158,7 @@ def _tap_like_and_verify(d, device_id: str, log, target: tuple[int, int, int]) -
         time.sleep(0.2)
         img1 = _screenshot(d)
         if img1 is None or _heart_fraction(img1, cx, cy, half) >= HEART_LIKED_FRACTION:
-            log(device_id, "Post already liked — skipping", "info")
+            log(device_id, "Post already liked — skipping", "info", {"event": "video_already_liked"})
             return "already_liked"
         img0 = img1
 
